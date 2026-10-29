@@ -1,0 +1,15 @@
+# Makepkg build and extraction directories
+src/
+pkg/
+
+# Downloaded source archives
+*.tar.zst
+*.tar.gz
+*.tar.xz
+
+# Built package archives
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# Build logs and namcap output
+*.log

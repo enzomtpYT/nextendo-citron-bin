@@ -1,0 +1,111 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: update-aur
+  cancel-in-progress: true
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    permissions:
+      contents: write
+
+    steps:
+      - name: Install base build and CI dependencies
+        run: |
+          pacman -Syu --noconfirm git openssh curl jq pacman-contrib namcap
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure safe Git directory & build user
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          if ! id -u builder >/dev/null 2>&1; then
+            useradd -m -d /tmp/builder builder
+            echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          fi
+          chown -R builder:builder "${GITHUB_WORKSPACE}"
+
+      - name: Configure SSH for AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "::warning ::AUR_SSH_PRIVATE_KEY secret is not set. Updates will not be pushed to AUR."
+            exit 0
+          fi
+          mkdir -p -m 0700 ~/.ssh
+          echo "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur_key
+          chmod 0600 ~/.ssh/aur_key
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config << 'EOF'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur_key
+            User aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 0600 ~/.ssh/config
+
+      - name: Run update script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./update.sh
+          ./update.sh
+
+      - name: Commit and push changes
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if git diff --quiet PKGBUILD .SRCINFO; then
+            echo "No package changes detected. Repository is up-to-date."
+            exit 0
+          fi
+
+          NEW_PKGVER=$(grep -E '^\s*pkgver =' .SRCINFO | head -n1 | awk '{print $3}')
+          echo "New package version detected: ${NEW_PKGVER}"
+
+          # Configure Git Identity
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 1. Commit and push back to GitHub tracking branch
+          echo "Pushing updates to GitHub tracking branch (${GITHUB_REF_NAME})..."
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${NEW_PKGVER}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          # 2. Deploy updated packaging files to AUR
+          if [ -n "${AUR_SSH_PRIVATE_KEY}" ]; then
+            echo "Pushing updates to AUR remote..."
+            AUR_DIR=$(mktemp -d)
+            git clone "ssh://aur@aur.archlinux.org/nextendo-citron-bin.git" "${AUR_DIR}"
+            cp PKGBUILD .SRCINFO "${AUR_DIR}/"
+            if [ -f .gitignore ]; then
+              cp .gitignore "${AUR_DIR}/"
+            fi
+            
+            cd "${AUR_DIR}"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add PKGBUILD .SRCINFO $([ -f .gitignore ] && echo .gitignore)
+            
+            if ! git diff --staged --quiet; then
+              git commit -m "Update to ${NEW_PKGVER}"
+              git push origin master
+              echo "Successfully pushed update to AUR."
+            else
+              echo "AUR is already in sync with ${NEW_PKGVER}."
+            fi
+          fi
